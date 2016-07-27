@@ -1,9 +1,9 @@
 environment:
   matrix:
-  - TARGET: x86_64-pc-windows-msvc
+  #- TARGET: x86_64-pc-windows-msvc
   - TARGET: i686-pc-windows-msvc
-  - TARGET: x86_64-pc-windows-gnu
-  - TARGET: i686-pc-windows-gnu
+  #- TARGET: x86_64-pc-windows-gnu
+  #- TARGET: i686-pc-windows-gnu
   access_token:
     secure: ZxcrtxQXwszRYNN6c1ZIagczEqzmQQZeYHY58izcmF0jdq/cptxJvFUoVxDmnoqj
 install:
@@ -19,7 +19,8 @@ build_script:
   - echo build
 test_script:
   - cargo test
-after_deploy:
+deploy_script:
+  - ps: $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
   - ps: Add-Content "$env:USERPROFILE\.git-credentials" "https://$($env:access_token):x-oauth-basic@github.com`n"
   - set deploy=1
   - if not "%APPVEYOR_REPO_NAME%" == "steffengy/schannel-rs" ( set deploy=0 )
