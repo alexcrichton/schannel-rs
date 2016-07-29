@@ -11,7 +11,7 @@ use std::ptr;
 use std::slice;
 use winapi;
 
-use {INIT_REQUESTS, Inner};
+use {INIT_REQUESTS, ACCEPT_REQUESTS, Inner, secbuf, secbuf_desc};
 use cert_store::CertStore;
 use security_context::SecurityContext;
 use context_buffer::ContextBuffer;
@@ -41,6 +41,7 @@ impl Drop for CertChainContext {
 pub struct Builder {
     domain: Option<Vec<u16>>,
     cert_store: Option<CertStore>,
+    accept: bool,
 }
 
 impl Builder {
@@ -58,21 +59,37 @@ impl Builder {
         self
     }
 
-    #[allow(dead_code)]
-    /* pub */ fn cert_store(&mut self, cert_store: CertStore) -> &mut Builder {
+    /// Specifies a custom certificate store which is later used when validating
+    /// a server's certificate.
+    ///
+    /// This option is only used for client connections and is used to construct
+    /// the certificate chain which the server's certificate is validated
+    /// against.
+    pub fn cert_store(&mut self, cert_store: CertStore) -> &mut Builder {
         self.cert_store = Some(cert_store);
         self
     }
 
+    /// Indicates whether this builder will be accepting a connection or not.
+    ///
+    /// For servers this flag should be set to `true`, and for clients no action
+    /// need be taken as this option is `false` by default.
+    pub fn accept(&mut self, accept: bool) -> &mut Builder {
+        self.accept = accept;
+        self
+    }
+
     /// Initializes a new TLS session.
-    pub fn initialize<S>(&self,
+    pub fn initialize<S>(&mut self,
                          mut cred: SchannelCred,
                          stream: S)
                          -> Result<TlsStream<S>, HandshakeError<S>>
         where S: Read + Write
     {
         let domain = self.domain.as_ref().map(|s| &s[..]);
-        let (ctxt, buf) = match SecurityContext::initialize(&mut cred, domain) {
+        let (ctxt, buf) = match SecurityContext::initialize(&mut cred,
+                                                            self.accept,
+                                                            domain) {
             Ok(pair) => pair,
             Err(e) => return Err(HandshakeError::Failure(e)),
         };
@@ -83,6 +100,8 @@ impl Builder {
             cert_store: self.cert_store.clone(),
             domain: self.domain.clone(),
             stream: stream,
+            accept: self.accept,
+            accept_first: true,
             state: State::Initializing {
                 needs_flush: false,
                 more_calls: true,
@@ -91,7 +110,7 @@ impl Builder {
             needs_read: true,
             dec_in: Cursor::new(Vec::new()),
             enc_in: Cursor::new(Vec::new()),
-            out_buf: Cursor::new(buf.to_owned()),
+            out_buf: Cursor::new(buf.map(|b| b.to_owned()).unwrap_or(Vec::new())),
         };
 
         MidHandshakeTlsStream {
@@ -118,6 +137,8 @@ pub struct TlsStream<S> {
     domain: Option<Vec<u16>>,
     stream: S,
     state: State,
+    accept: bool,
+    accept_first: bool,
     needs_read: bool,
     // valid from position() to len()
     dec_in: Cursor<Vec<u8>>,
@@ -151,27 +172,6 @@ impl<S> fmt::Debug for TlsStream<S>
         fmt.debug_struct("TlsStream")
             .field("stream", &self.stream)
             .finish()
-    }
-}
-
-unsafe fn secbuf(buftype: winapi::c_ulong,
-                 bytes: Option<&mut [u8]>) -> winapi::SecBuffer {
-    let (ptr, len) = match bytes {
-        Some(bytes) => (bytes.as_mut_ptr(), bytes.len() as winapi::c_ulong),
-        None => (ptr::null_mut(), 0),
-    };
-    winapi::SecBuffer {
-        BufferType: buftype,
-        cbBuffer: len,
-        pvBuffer: ptr as *mut winapi::c_void,
-    }
-}
-
-unsafe fn secbuf_desc(bufs: &mut [winapi::SecBuffer]) -> winapi::SecBufferDesc {
-    winapi::SecBufferDesc {
-        ulVersion: winapi::SECBUFFER_VERSION,
-        cBuffers: bufs.len() as winapi::c_ulong,
-        pBuffers: bufs.as_mut_ptr(),
     }
 }
 
@@ -231,16 +231,12 @@ impl<S> TlsStream<S>
 
     fn step_initialize(&mut self) -> io::Result<()> {
         unsafe {
-            let domain = self.domain
-                .as_ref()
-                .map(|b| b.as_ptr() as *mut u16)
-                .unwrap_or(ptr::null_mut());
-
             let pos = self.enc_in.position() as usize;
             let mut inbufs = [secbuf(winapi::SECBUFFER_TOKEN,
                                      Some(&mut self.enc_in.get_mut()[..pos])),
                               secbuf(winapi::SECBUFFER_EMPTY, None)];
             let mut inbuf_desc = secbuf_desc(&mut inbufs);
+            debug!("initializing/accepting with {} input bytes", pos);
 
             let mut outbufs = [secbuf(winapi::SECBUFFER_TOKEN, None),
                                secbuf(winapi::SECBUFFER_ALERT, None),
@@ -249,18 +245,44 @@ impl<S> TlsStream<S>
 
             let mut attributes = 0;
 
-            let status = secur32::InitializeSecurityContextW(self.cred.get_mut(),
-                                                             self.context.get_mut(),
-                                                             domain,
-                                                             INIT_REQUESTS,
-                                                             0,
-                                                             0,
-                                                             &mut inbuf_desc,
-                                                             0,
-                                                             ptr::null_mut(),
-                                                             &mut outbuf_desc,
-                                                             &mut attributes,
-                                                             ptr::null_mut());
+            let status = if self.accept {
+                let ptr = if self.accept_first {
+                    ptr::null_mut()
+                } else {
+                    self.context.get_mut()
+                };
+                self.accept_first = false;
+                debug!("accept({:p})", self.context.get_mut());
+                secur32::AcceptSecurityContext(self.cred.get_mut(),
+                                               ptr,
+                                               &mut inbuf_desc,
+                                               ACCEPT_REQUESTS,
+                                               0,
+                                               self.context.get_mut(),
+                                               &mut outbuf_desc,
+                                               &mut attributes,
+                                               ptr::null_mut())
+            } else {
+                let domain = self.domain
+                    .as_ref()
+                    .map(|b| b.as_ptr() as *mut u16)
+                    .unwrap_or(ptr::null_mut());
+
+                debug!("initialize({:p})", self.context.get_mut());
+                secur32::InitializeSecurityContextW(self.cred.get_mut(),
+                                                    self.context.get_mut(),
+                                                    domain,
+                                                    INIT_REQUESTS,
+                                                    0,
+                                                    0,
+                                                    &mut inbuf_desc,
+                                                    0,
+                                                    ptr::null_mut(),
+                                                    &mut outbuf_desc,
+                                                    &mut attributes,
+                                                    ptr::null_mut())
+            };
+            debug!("attributes: {:x}", attributes);
 
             for buf in &outbufs[1..] {
                 if !buf.pvBuffer.is_null() {
@@ -270,6 +292,7 @@ impl<S> TlsStream<S>
 
             match status {
                 winapi::SEC_I_CONTINUE_NEEDED => {
+                    debug!("continue needed");
                     let nread = if inbufs[1].BufferType == winapi::SECBUFFER_EXTRA {
                         self.enc_in.position() as usize - inbufs[1].cbBuffer as usize
                     } else {
@@ -281,8 +304,12 @@ impl<S> TlsStream<S>
                     self.needs_read = self.enc_in.position() == 0;
                     self.out_buf.get_mut().extend_from_slice(&to_write);
                 }
-                winapi::SEC_E_INCOMPLETE_MESSAGE => self.needs_read = true,
+                winapi::SEC_E_INCOMPLETE_MESSAGE => {
+                    debug!("incomplete message");
+                    self.needs_read = true;
+                }
                 winapi::SEC_E_OK => {
+                    debug!("security context ok");
                     let nread = if inbufs[1].BufferType == winapi::SECBUFFER_EXTRA {
                         self.enc_in.position() as usize - inbufs[1].cbBuffer as usize
                     } else {
@@ -306,7 +333,11 @@ impl<S> TlsStream<S>
                         *more_calls = false;
                     }
                 }
-                _ => return Err(io::Error::from_raw_os_error(status as i32)),
+                _ => {
+                    let err = io::Error::from_raw_os_error(status as i32);
+                    debug!("initialize/accept error: {:?}", err);
+                    return Err(err)
+                }
             }
             Ok(())
         }
@@ -357,6 +388,12 @@ impl<S> TlsStream<S>
     }
 
     fn validate(&mut self) -> io::Result<()> {
+        // If we're accepting connections then we don't perform any validation
+        // fo the remote certificate, that's what they're doing!
+        if self.accept {
+            return Ok(())
+        }
+
         let cert_context = try!(self.context.remote_cert());
 
         let cert_chain = unsafe {
@@ -379,7 +416,7 @@ impl<S> TlsStream<S>
             para.RequestedUsage.Usage.cUsageIdentifier = identifiers.len() as winapi::DWORD;
             para.RequestedUsage.Usage.rgpszUsageIdentifier = identifiers.as_mut_ptr();
 
-            let mut cert_chain = mem::uninitialized();
+            let mut cert_chain = mem::zeroed();
 
             let res = crypt32::CertGetCertificateChain(ptr::null_mut(),
                                                        cert_context.as_inner(),
@@ -393,7 +430,9 @@ impl<S> TlsStream<S>
             if res == winapi::TRUE {
                 CertChainContext(cert_chain as *mut _)
             } else {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                debug!("CertGetCertificateChain error -- {:?}", err);
+                return Err(err)
             }
         };
 
@@ -418,11 +457,15 @@ impl<S> TlsStream<S>
                                                                 &mut para,
                                                                 &mut status);
             if res == winapi::FALSE {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                debug!("CertVerifyCertificateChainPolicy error {:?}", err);
+                return Err(err)
             }
 
             if status.dwError != winapi::ERROR_SUCCESS {
-                return Err(io::Error::from_raw_os_error(status.dwError as i32));
+                let err = io::Error::from_raw_os_error(status.dwError as i32);
+                debug!("stat.dwError error {:?}", err);
+                return Err(err)
             }
         }
 
@@ -520,7 +563,11 @@ impl<S> TlsStream<S>
                     self.needs_read = self.enc_in.position() == 0;
                     Ok(())
                 }
-                e => Err(io::Error::from_raw_os_error(e as i32)),
+                e => {
+                    let err = io::Error::from_raw_os_error(e as i32);
+                    debug!("decrypt error {:?}", e);
+                    Err(err)
+                }
             }
         }
     }
@@ -562,7 +609,11 @@ impl<S> TlsStream<S>
                     self.out_buf.set_position(0);
                     Ok(())
                 }
-                err => Err(io::Error::from_raw_os_error(err as i32)),
+                err => {
+                    let err = io::Error::from_raw_os_error(err as i32);
+                    debug!("failed to encrypt: {:?}", err);
+                    Err(err)
+                }
             }
         }
     }
@@ -586,9 +637,13 @@ impl<S> MidHandshakeTlsStream<S>
         match self.inner.initialize() {
             Ok(_) => Ok(self.inner),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                debug!("handshake incomplete");
                 Err(HandshakeError::Interrupted(self))
             }
-            Err(e) => Err(HandshakeError::Failure(e)),
+            Err(e) => {
+                debug!("handshake error: {:?}", e);
+                Err(HandshakeError::Failure(e))
+            }
         }
     }
 }
