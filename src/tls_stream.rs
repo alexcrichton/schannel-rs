@@ -234,7 +234,9 @@ impl<S> TlsStream<S>
             let pos = self.enc_in.position() as usize;
             let mut inbufs = [secbuf(winapi::SECBUFFER_TOKEN,
                                      Some(&mut self.enc_in.get_mut()[..pos])),
-                              secbuf(winapi::SECBUFFER_EMPTY, None)];
+                              secbuf(winapi::SECBUFFER_EMPTY, None),
+                              secbuf(winapi::SECBUFFER_MISSING, None),
+                              ];
             let mut inbuf_desc = secbuf_desc(&mut inbufs);
             debug!("initializing/accepting with {} input bytes", pos);
 
@@ -251,7 +253,6 @@ impl<S> TlsStream<S>
                 } else {
                     self.context.get_mut()
                 };
-                self.accept_first = false;
                 debug!("accept({:p})", self.context.get_mut());
                 secur32::AcceptSecurityContext(self.cred.get_mut(),
                                                ptr,
@@ -284,6 +285,10 @@ impl<S> TlsStream<S>
             };
             debug!("attributes: {:x}", attributes);
 
+            debug!("{:?}", inbufs);
+            debug!("{:?}", inbuf_desc);
+            debug!("{:?}", outbufs);
+            debug!("{:?}", outbuf_desc);
             for buf in &outbufs[1..] {
                 if !buf.pvBuffer.is_null() {
                     secur32::FreeContextBuffer(buf.pvBuffer);
@@ -292,6 +297,7 @@ impl<S> TlsStream<S>
 
             match status {
                 winapi::SEC_I_CONTINUE_NEEDED => {
+                    self.accept_first = false;
                     debug!("continue needed");
                     let nread = if inbufs[1].BufferType == winapi::SECBUFFER_EXTRA {
                         self.enc_in.position() as usize - inbufs[1].cbBuffer as usize
